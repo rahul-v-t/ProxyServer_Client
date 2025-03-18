@@ -1,127 +1,122 @@
 import java.io.*;
 import java.net.*;
-// import java.util.concurrent.LinkedBlockingQueue;
-
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.ArrayList;
+import java.util.List;
 
 public class ProxyServer {
     private ServerSocket serverSocket;
-    private static final int PORT = 8084;
+    private LinkedBlockingQueue<Socket> requestQueue = new LinkedBlockingQueue<>();
+    private static final int PORT = 8091;
 
     public ProxyServer() {
         try {
             serverSocket = new ServerSocket(PORT);
             System.out.println("Proxy Server started on port " + PORT);
         } catch (IOException e) {
-            System.err.println("Could not listen on port: " + PORT);
+            System.err.println("Could not listen on port: " + PORT + ": " + e.getMessage());
             System.exit(1);
         }
     }
 
     public void start() {
-        while (true) {
-            try {
-                // Accept client connection
-                Socket clientSocket = serverSocket.accept();
-                System.out.println("New client connected: " + clientSocket.getInetAddress());
-                
-                // Handle request in a new thread
-                new Thread(new ClientHandler(clientSocket)).start();
-                
-            } catch (IOException e) {
-                System.err.println("Accept failed: " + e.getMessage());
+        new Thread(() -> {
+            while (true) {
+                try {
+                    Socket clientSocket = serverSocket.accept();
+                    System.out.println("Accepted connection from: " + clientSocket.getInetAddress());
+                    requestQueue.put(clientSocket);
+                } catch (IOException | InterruptedException e) {
+                    System.err.println("Error accepting connection: " + e.getMessage());
+                    if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+                }
             }
-        }
+        }).start();
+
+        new Thread(() -> {
+            while (true) {
+                try {
+                    Socket clientSocket = requestQueue.take();
+                    new Thread(new ClientHandler(clientSocket)).start();
+                } catch (InterruptedException e) {
+                    System.err.println("Interrupted while taking from queue: " + e.getMessage());
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }).start();
     }
 
     public static void main(String[] args) {
         ProxyServer proxy = new ProxyServer();
         proxy.start();
     }
-}
 
+    class ClientHandler implements Runnable {
+        private Socket clientSocket;
 
+        public ClientHandler(Socket socket) {
+            this.clientSocket = socket;
+        }
 
-// public class ProxyServer {
-//     private LinkedBlockingQueue<Socket> requestQueue = new LinkedBlockingQueue<>();
-//     private ServerSocket serverSocket ; // Declared as class field
-//     private static final int PORT = 8082;
-//     public void start() {
-//         // Accept thread
-//         new Thread(() -> {
-//             while (true) {
-//                 try {
-//                     serverSocket = new ServerSocket(PORT);
-//                     requestQueue.put(serverSocket.accept());
-//                 } catch (Exception e) {
-//                     System.err.println("Error accepting: " + e.getMessage());
-//                 }
-//             }
-//         }).start();
-        
-//         // Processing thread
-//         while (true) {
-//             try {
-//                 Socket clientSocket = requestQueue.take();
-//                 new ClientHandler(clientSocket).run(); // Process synchronously
-//             } catch (InterruptedException e) {
-//                 Thread.currentThread().interrupt();
-//             }
-//         }
-//     }
-//     public static void main(String[] args) {
-//         ProxyServer proxy = new ProxyServer();
-//         proxy.start();
-//     }
-// }
-
-
-
-class ClientHandler implements Runnable {
-    private Socket clientSocket;
-    private static final String TARGET_HOST = "example.com";
-    private static final int TARGET_PORT = 80;
-
-    public ClientHandler(Socket socket) {
-        this.clientSocket = socket;
-    }
-
-    @Override
-    public void run() {
-        try (
-            // Client streams
-            BufferedReader clientIn = new BufferedReader(
-                new InputStreamReader(clientSocket.getInputStream()));
-            PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true);
-            
-            // Target server socket and streams
-            Socket targetSocket = new Socket(TARGET_HOST, TARGET_PORT);
-            PrintWriter targetOut = new PrintWriter(targetSocket.getOutputStream(), true);
-            BufferedReader targetIn = new BufferedReader(
-                new InputStreamReader(targetSocket.getInputStream()))
-        ) {
-            // Read client request
-            String requestLine;
-            while ((requestLine = clientIn.readLine()) != null) {
-                if (requestLine.isEmpty()) {
-                    break;
+        @Override
+        public void run() {
+            try (
+                BufferedReader clientIn = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+                PrintWriter clientOut = new PrintWriter(clientSocket.getOutputStream(), true)
+            ) {
+                // Read and store full request
+                String requestLine = clientIn.readLine();
+                if (requestLine == null || requestLine.isEmpty()) {
+                    return;
                 }
                 System.out.println("Request: " + requestLine);
-                targetOut.println(requestLine);
-            }
 
-            // Send response back to client
-            String responseLine;
-            while ((responseLine = targetIn.readLine()) != null) {
-                clientOut.println(responseLine);
-            }
+                List<String> headers = new ArrayList<>();
+                String host = null;
+                String line;
+                while ((line = clientIn.readLine()) != null && !line.isEmpty()) {
+                    headers.add(line);
+                    System.out.println("Header: " + line);
+                    if (line.toLowerCase().startsWith("host:")) {
+                        host = line.split(":", 2)[1].trim();
+                    }
+                }
 
-        } catch (IOException e) {
-            System.err.println("Error handling request: " + e.getMessage());
-        } finally {
-            try {
-                clientSocket.close();
+                if (host == null) {
+                    String[] requestParts = requestLine.split(" ");
+                    if (requestParts.length < 2) return;
+                    URL targetUrl = new URL(requestParts[1]);
+                    host = targetUrl.getHost();
+                }
+
+                // Connect to target server
+                try (
+                    Socket targetSocket = new Socket(host, 80);
+                    PrintWriter targetOut = new PrintWriter(targetSocket.getOutputStream(), true);
+                    BufferedReader targetIn = new BufferedReader(new InputStreamReader(targetSocket.getInputStream()))
+                ) {
+                    // Forward full request
+                    targetOut.println(requestLine);
+                    for (String header : headers) {
+                        targetOut.println(header);
+                    }
+                    targetOut.println(); // End headers
+
+                    // Forward response
+                    String responseLine;
+                    while ((responseLine = targetIn.readLine()) != null) {
+                        clientOut.println(responseLine);
+                    }
+                }
+
             } catch (IOException e) {
-                System.err.println("Error closing client socket: " + e.getMessage());
+                System.err.println("Error handling request: " + e.getMessage());
+            } finally {
+                try {
+                    clientSocket.close();
+                } catch (IOException e) {
+                    System.err.println("Error closing client socket: " + e.getMessage());
+                }
             }
         }
     }
