@@ -7,7 +7,7 @@ import java.util.List;
 public class ProxyServer {
     private ServerSocket serverSocket;
     private LinkedBlockingQueue<Socket> requestQueue = new LinkedBlockingQueue<>();
-    private static final int PORT = 8091;
+    private static final int PORT = 8092;
 
     public ProxyServer() {
         try {
